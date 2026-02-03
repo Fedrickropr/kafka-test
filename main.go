@@ -14,33 +14,34 @@ import (
 
 const Address string = "localhost:9092"
 
-var Topics []string = []string{"testTopic"}
+var topics []string = []string{"apples", "oranges", "bananas"}
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cleanup(stop, Topics...)
+	defer cleanup(stop, topics...)
 
 	log.Printf("Started")
 
 	var wg sync.WaitGroup
 
-	createTopic(Topics...)
+	createTopic(topics...)
 
 	// Register consumer
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		consume()
+		consume(topics...)
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		produce()
+		produce(topics...)
 	}()
 
-	<-ctx.Done()
 	wg.Wait()
+
+	<-ctx.Done()
 	log.Printf("Shutting down")
 }
 
@@ -72,47 +73,51 @@ func createTopic(topics ...string) {
 }
 
 func produce(topics ...string) {
-	log.Printf("producing")
+	log.Printf("[prod] producing")
 
-	for topic := range topics {
+	for _, topic := range topics {
+		log.Printf("[prod] writing to topic %s", topic)
+
 		writer := kafka.Writer{
 			Addr:     kafka.TCP("Localhost:9092"),
-			Topic:    "first-data",
+			Topic:    topic,
 			Balancer: &kafka.LeastBytes{},
 		}
-	}
 
-	defer writer.Close()
-
-	if err := writer.WriteMessages(context.Background(), kafka.Message{
-		Key:   []byte(fmt.Sprintf("Key")),
-		Value: []byte(fmt.Sprintf("Value")),
-	}); err != nil {
-		log.Printf("error writing message %s", err.Error())
-		return
-	}
-
-	log.Printf("wrote Message")
-}
-
-func consume() {
-	log.Printf("consuming")
-
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{Address},
-		GroupID: "consumer-group-1", // Allows scaling multiple consumers
-		Topic:   "first-data",
-	})
-
-	defer reader.Close()
-
-	for {
-		m, err := reader.ReadMessage(context.Background())
-		if err != nil {
-			log.Fatal("failed to read message:", err)
+		if err := writer.WriteMessages(context.Background(), kafka.Message{
+			Key:   []byte(fmt.Sprintf("Key_topic_%s", topic)),
+			Value: []byte(fmt.Sprintf("Value_topic_%s", topic)),
+		}); err != nil {
+			log.Printf("[prod] error writing message %s", err.Error())
+			return
 		}
 
-		log.Printf("received: %s (Offset: %d)\n", string(m.Value), m.Offset)
+		log.Printf("[prod] wrote Message to topic %s", topic)
+
+		defer writer.Close()
+	}
+
+}
+
+func consume(topics ...string) {
+	log.Printf("[cons] consuming")
+
+	for _, topic := range topics {
+		log.Printf("[cons] reading from topic %s", topic)
+		reader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers: []string{Address},
+			Topic:   topic,
+		})
+
+		message, err := reader.ReadMessage(context.Background())
+		if err != nil {
+			log.Fatal("[cons] failed to read message:", err)
+			return
+		}
+
+		log.Printf("[cons] received: %s, %s \n", string(message.Key), string(message.Value))
+
+		reader.Close()
 	}
 }
 

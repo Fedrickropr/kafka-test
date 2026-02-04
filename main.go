@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/segmentio/kafka-go"
 )
@@ -17,36 +19,73 @@ const Address string = "localhost:9092"
 var topics []string = []string{"apples", "oranges", "bananas"}
 
 func main() {
+	batchSize := flag.Int("batch", 1, "Number of messages per batch")
+	workers := flag.Int("workers", 1, "Number of consumers to start")
+	flag.Parse()
+
+	log.Printf("Using batch size %d worker count %d", *batchSize, *workers)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cleanup(stop, topics...)
+	defer cleanup(stop, topics...) // will also clean up topics
 
 	log.Printf("Started")
 
 	var wg sync.WaitGroup
 
-	createTopic(topics...)
+	// set numPartitions to number of workers, so everyone has their own partition
+	createTopic(*workers, topics...)
 
-	// Register consumer
+	prodChan := make(chan ProduceRecord, len(topics))
+	consChan := make(chan ConsumeRecord, len(topics)**workers**batchSize)
+
+	for i := 0; i < *workers; i++ {
+		for _, topic := range topics {
+			wg.Add(1)
+			go func(id int, topic string) {
+				defer wg.Done()
+				consume(ctx, consChan, id, *batchSize, topic)
+			}(i, topic)
+		}
+	}
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		consume(topics...)
+		produce(ctx, prodChan, *batchSize, topics...)
 	}()
 
-	wg.Add(1)
+	var resWg sync.WaitGroup
+	var prodResults []ProduceRecord
+	var consResults []ConsumeRecord
+	resWg.Add(1)
 	go func() {
-		defer wg.Done()
-		produce(topics...)
+		defer resWg.Done()
+		for r := range prodChan {
+			prodResults = append(prodResults, r)
+		}
+	}()
+	resWg.Add(1)
+	go func() {
+		defer resWg.Done()
+		for r := range consChan {
+			consResults = append(consResults, r)
+		}
 	}()
 
 	wg.Wait()
+	close(prodChan)
+	close(consChan)
+
+	resWg.Wait()
+
+	log.Printf("Got producer results: %d", len(prodResults))
+	log.Printf("Got producer results: %d", len(consResults))
 
 	<-ctx.Done()
-	log.Printf("Shutting down")
+	log.Println("Shutting down")
 }
 
-func createTopic(topics ...string) {
-	// TODO create a topic
+func createTopic(numPartitions int, topics ...string) {
 	conn, err := kafka.Dial("tcp", Address)
 	if err != nil {
 		log.Printf("could not dial Kafka")
@@ -59,7 +98,7 @@ func createTopic(topics ...string) {
 	for _, topic := range topics {
 		topicList = append(topicList, kafka.TopicConfig{
 			Topic:             topic,
-			NumPartitions:     1,
+			NumPartitions:     numPartitions,
 			ReplicationFactor: 1,
 		})
 	}
@@ -72,53 +111,78 @@ func createTopic(topics ...string) {
 	log.Printf("created Topics")
 }
 
-func produce(topics ...string) {
+type ProduceRecord struct {
+	time  int64
+	topic string
+	keys  []string
+}
+
+func produce(ctx context.Context, res chan<- ProduceRecord, batchSize int, topics ...string) {
 	log.Printf("[prod] producing")
 
 	for _, topic := range topics {
 		log.Printf("[prod] writing to topic %s", topic)
 
 		writer := kafka.Writer{
-			Addr:     kafka.TCP("Localhost:9092"),
+			Addr:     kafka.TCP(Address),
 			Topic:    topic,
 			Balancer: &kafka.LeastBytes{},
 		}
 
-		if err := writer.WriteMessages(context.Background(), kafka.Message{
-			Key:   []byte(fmt.Sprintf("Key_topic_%s", topic)),
-			Value: []byte(fmt.Sprintf("Value_topic_%s", topic)),
-		}); err != nil {
+		var messages []kafka.Message
+		var keys []string
+		for i := 0; i < batchSize; i++ {
+			key := fmt.Sprintf("Key_%s_%d", topic, i)
+			messages = append(messages, kafka.Message{
+				Key:   []byte(key),
+				Value: []byte(fmt.Sprintf("Value_topic_%s_%d", topic, i)),
+			})
+
+			keys = append(keys, key)
+		}
+
+		if err := writer.WriteMessages(ctx, messages...); err != nil {
 			log.Printf("[prod] error writing message %s", err.Error())
 			return
 		}
 
-		log.Printf("[prod] wrote Message to topic %s", topic)
+		res <- ProduceRecord{time.Now().UnixMilli(), topic, keys}
 
-		defer writer.Close()
+		log.Printf("[prod] wrote messages to topic %s", topic)
+
+		writer.Close()
 	}
-
 }
 
-func consume(topics ...string) {
-	log.Printf("[cons] consuming")
+type ConsumeRecord struct {
+	time   int64
+	topic  string
+	worker int
+	key    string
+}
 
-	for _, topic := range topics {
-		log.Printf("[cons] reading from topic %s", topic)
-		reader := kafka.NewReader(kafka.ReaderConfig{
-			Brokers: []string{Address},
-			Topic:   topic,
-		})
+func consume(ctx context.Context, res chan<- ConsumeRecord, workerId int, batchSize int, topic string) {
+	log.Printf("[cons_%d] consuming", workerId)
 
-		message, err := reader.ReadMessage(context.Background())
+	log.Printf("[cons_%d] reading from topic %s", workerId, topic)
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:     []string{Address},
+		Topic:       topic,
+		StartOffset: kafka.FirstOffset,
+	})
+
+	for i := 0; i < batchSize; i++ {
+		message, err := reader.ReadMessage(ctx)
 		if err != nil {
-			log.Fatal("[cons] failed to read message:", err)
+			log.Fatal(fmt.Sprintf("[cons_%d] failed to read message:", workerId), err)
 			return
 		}
 
-		log.Printf("[cons] received: %s, %s \n", string(message.Key), string(message.Value))
-
-		reader.Close()
+		res <- ConsumeRecord{time.Now().UnixMilli(), topic, workerId, string(message.Key)}
+		log.Printf("[cons_%d] received: %s, %s \n", workerId, string(message.Key), string(message.Value))
 	}
+
+	reader.Close()
 }
 
 func cleanup(stop context.CancelFunc, topics ...string) {
